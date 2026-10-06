@@ -31,6 +31,8 @@ LIMIT 10;
 
 -- -----------------------------------------------------------------------------
 -- 2. Productos con Bajas Ventas:
+-- (Cancelados excluidos con INNER JOIN anidado a ventas: antes el filtro en un
+-- LEFT JOIN solo anulaba v, pero las líneas de d se seguían sumando.)
 -- Identificar los productos en el 10% inferior de ventas para considerar su descontinuación.
 -- -----------------------------------------------------------------------------
 WITH VentasPorProducto AS (
@@ -45,8 +47,9 @@ WITH VentasPorProducto AS (
         NTILE(10) OVER (ORDER BY COALESCE(SUM(d.cantidad * d.precio_unitario_congelado), 0.00) ASC) AS decil_ventas
     FROM productos p
     INNER JOIN categorias c ON p.id_categoria = c.id_categoria
-    LEFT JOIN detalle_ventas d ON p.id_producto = d.id_producto
-    LEFT JOIN ventas v ON d.id_venta = v.id_venta AND v.estado <> 'Cancelado'
+    LEFT JOIN (detalle_ventas d
+               INNER JOIN ventas v ON d.id_venta = v.id_venta AND v.estado <> 'Cancelado')
+           ON p.id_producto = d.id_producto
     GROUP BY p.id_producto, p.sku, p.nombre, c.nombre, p.stock, p.precio
 )
 SELECT 
@@ -176,28 +179,37 @@ LIMIT 10;
 -- 8. Rotación de Inventario:
 -- Calcular la tasa de rotación de stock para cada categoría de producto.
 -- (Rotación = Costo Total de Bienes Vendidos [COGS] / Valor del Inventario Actual)
+-- El inventario y el COGS se calculan en subconsultas SEPARADAS para que el valor
+-- del inventario no se multiplique por el número de líneas de venta.
 -- -----------------------------------------------------------------------------
 SELECT 
     c.id_categoria,
     c.nombre AS categoria,
-    COALESCE(SUM(d.cantidad * p.costo), 0.00) AS costo_mercancia_vendida_cogs,
-    SUM(p.stock * p.costo) AS valor_inventario_actual,
+    COALESCE(cogs.costo_vendido, 0.00) AS costo_mercancia_vendida_cogs,
+    inv.valor_inventario AS valor_inventario_actual,
     COALESCE(
-        ROUND(
-            SUM(d.cantidad * p.costo) / NULLIF(SUM(p.stock * p.costo), 0), 
-        3), 
+        ROUND(cogs.costo_vendido / NULLIF(inv.valor_inventario, 0), 3), 
     0.000) AS indice_rotacion_inventario
 FROM categorias c
-INNER JOIN productos p ON c.id_categoria = p.id_categoria
-LEFT JOIN detalle_ventas d ON p.id_producto = d.id_producto
-LEFT JOIN ventas v ON d.id_venta = v.id_venta AND v.estado <> 'Cancelado'
-GROUP BY c.id_categoria, c.nombre
+INNER JOIN (
+    SELECT id_categoria, SUM(stock * costo) AS valor_inventario
+    FROM productos
+    GROUP BY id_categoria
+) inv ON c.id_categoria = inv.id_categoria
+LEFT JOIN (
+    SELECT p.id_categoria, SUM(d.cantidad * p.costo) AS costo_vendido
+    FROM detalle_ventas d
+    INNER JOIN ventas v ON d.id_venta = v.id_venta AND v.estado <> 'Cancelado'
+    INNER JOIN productos p ON d.id_producto = p.id_producto
+    GROUP BY p.id_categoria
+) cogs ON c.id_categoria = cogs.id_categoria
 ORDER BY indice_rotacion_inventario DESC;
 
 
 -- -----------------------------------------------------------------------------
 -- 9. Productos que Necesitan Reabastecimiento:
--- Listar productos cuyo stock actual está por debajo de su umbral mínimo.
+-- Listar productos cuyo stock actual está por debajo de su umbral mínimo
+-- (columna productos.umbral_minimo, ya renombrada en 01).
 -- -----------------------------------------------------------------------------
 SELECT 
     p.id_producto,
@@ -219,25 +231,27 @@ ORDER BY (p.umbral_minimo - p.stock) DESC, p.stock ASC;
 
 -- -----------------------------------------------------------------------------
 -- 10. Análisis de Carrito Abandonado (Simulado):
--- Identificar clientes que agregaron productos pero no completaron una venta en un período determinado.
+-- Identificar clientes que agregaron productos pero no completaron una venta.
+-- Usa las tablas carritos (cabecera) y detalle_carrito (líneas).
 -- -----------------------------------------------------------------------------
 SELECT 
-    cb.id_carrito,
+    ca.id_carrito,
     c.id_cliente,
     CONCAT(c.nombre, ' ', c.apellido) AS cliente,
     c.email,
     p.nombre AS producto_abandonado,
-    cb.cantidad,
+    dc.cantidad,
     p.precio,
-    (cb.cantidad * p.precio) AS valor_carrito,
-    cb.fecha_creacion AS fecha_abandono,
-    TIMESTAMPDIFF(HOUR, cb.fecha_creacion, NOW()) AS horas_abandonado
-FROM carrito_compras cb
-INNER JOIN clientes c ON cb.id_cliente = c.id_cliente
-INNER JOIN productos p ON cb.id_producto = p.id_producto
-WHERE cb.recuperado = FALSE
-  AND cb.fecha_creacion < DATE_SUB(NOW(), INTERVAL 24 HOUR)
-ORDER BY cb.fecha_creacion DESC;
+    (dc.cantidad * p.precio) AS valor_carrito,
+    ca.fecha_creacion AS fecha_abandono,
+    TIMESTAMPDIFF(HOUR, ca.fecha_creacion, NOW()) AS horas_abandonado
+FROM carritos ca
+INNER JOIN detalle_carrito dc ON ca.id_carrito = dc.id_carrito
+INNER JOIN clientes c ON ca.id_cliente = c.id_cliente
+INNER JOIN productos p ON dc.id_producto = p.id_producto
+WHERE ca.estado = 'Abandonado'
+  AND ca.fecha_creacion < DATE_SUB(NOW(), INTERVAL 24 HOUR)
+ORDER BY ca.fecha_creacion DESC;
 
 
 -- -----------------------------------------------------------------------------
@@ -255,8 +269,9 @@ SELECT
     COALESCE(SUM(d.cantidad * (d.precio_unitario_congelado - p.costo)), 0.00) AS margen_bruto_generado
 FROM proveedores pr
 LEFT JOIN productos p ON pr.id_proveedor = p.id_proveedor
-LEFT JOIN detalle_ventas d ON p.id_producto = d.id_producto
-LEFT JOIN ventas v ON d.id_venta = v.id_venta AND v.estado <> 'Cancelado'
+LEFT JOIN (detalle_ventas d
+           INNER JOIN ventas v ON d.id_venta = v.id_venta AND v.estado <> 'Cancelado')
+       ON p.id_producto = d.id_producto
 GROUP BY pr.id_proveedor, pr.nombre, pr.email_contacto
 ORDER BY ingresos_totales_generados DESC;
 
@@ -310,33 +325,46 @@ ORDER BY cantidad_transacciones DESC, total_facturado DESC;
 
 -- -----------------------------------------------------------------------------
 -- 14. Impacto de Promociones:
--- Comparar las ventas de un producto antes, durante y después de una campaña de descuento.
--- Caso de estudio: Campaña 'TECHWEEK2025' (2025-02-10 al 2025-02-17) sobre Laptop UltraBook (ID 1)
+-- Comparar las ventas de un producto antes, durante y después de una campaña.
+-- Campaña (tabla promociones): 15% del 2026-05-20 al 2026-06-05, producto ID 1.
+-- Las ventanas "antes" y "después" tienen la misma duración que la promoción.
+-- El nombre del producto sale de la tabla productos (no va escrito a mano).
+-- Para otra campaña, cambia solo las variables de abajo.
 -- -----------------------------------------------------------------------------
+SET @promo_inicio = DATE('2026-05-20');
+SET @promo_fin    = DATE('2026-06-05');
+SET @promo_dias   = DATEDIFF(@promo_fin, @promo_inicio) + 1;
+SET @id_producto_promo = 1;
+
 SELECT 
     p.nombre AS producto,
-    'TECHWEEK2025 (2025-02-10 al 2025-02-17)' AS promocion_evaluada,
-    SUM(CASE 
-        WHEN v.fecha_venta BETWEEN '2025-02-01 00:00:00' AND '2025-02-09 23:59:59' 
+    CONCAT('Promoción 15% (', @promo_inicio, ' al ', @promo_fin, ')') AS promocion_evaluada,
+    COALESCE(SUM(CASE 
+        WHEN v.fecha_venta >= DATE_SUB(@promo_inicio, INTERVAL @promo_dias DAY)
+         AND v.fecha_venta <  @promo_inicio
         THEN d.cantidad ELSE 0 
-    END) AS unidades_antes_promo,
-    SUM(CASE 
-        WHEN v.fecha_venta BETWEEN '2025-02-10 00:00:00' AND '2025-02-17 23:59:59' 
+    END), 0) AS unidades_antes_promo,
+    COALESCE(SUM(CASE 
+        WHEN v.fecha_venta >= @promo_inicio
+         AND v.fecha_venta <  DATE_ADD(@promo_fin, INTERVAL 1 DAY)
         THEN d.cantidad ELSE 0 
-    END) AS unidades_durante_promo,
-    SUM(CASE 
-        WHEN v.fecha_venta BETWEEN '2025-02-18 00:00:00' AND '2025-02-28 23:59:59' 
+    END), 0) AS unidades_durante_promo,
+    COALESCE(SUM(CASE 
+        WHEN v.fecha_venta >= DATE_ADD(@promo_fin, INTERVAL 1 DAY)
+         AND v.fecha_venta <  DATE_ADD(@promo_fin, INTERVAL @promo_dias + 1 DAY)
         THEN d.cantidad ELSE 0 
-    END) AS unidades_despues_promo,
-    SUM(CASE 
-        WHEN v.fecha_venta BETWEEN '2025-02-10 00:00:00' AND '2025-02-17 23:59:59' 
+    END), 0) AS unidades_despues_promo,
+    COALESCE(SUM(CASE 
+        WHEN v.fecha_venta >= @promo_inicio
+         AND v.fecha_venta <  DATE_ADD(@promo_fin, INTERVAL 1 DAY)
         THEN d.cantidad * d.precio_unitario_congelado ELSE 0 
-    END) AS facturacion_durante_promo
+    END), 0.00) AS facturacion_durante_promo
 FROM productos p
-LEFT JOIN detalle_ventas d ON p.id_producto = d.id_producto
-LEFT JOIN ventas v ON d.id_venta = v.id_venta AND v.estado <> 'Cancelado'
-WHERE p.id_producto = 1
-GROUP BY p.nombre;
+LEFT JOIN (detalle_ventas d
+           INNER JOIN ventas v ON d.id_venta = v.id_venta AND v.estado <> 'Cancelado')
+       ON p.id_producto = d.id_producto
+WHERE p.id_producto = @id_producto_promo
+GROUP BY p.id_producto, p.nombre;
 
 
 -- -----------------------------------------------------------------------------
@@ -393,8 +421,9 @@ SELECT
     COALESCE(SUM(d.cantidad * (d.precio_unitario_congelado - p.costo)), 0.00) AS beneficio_total_acumulado
 FROM productos p
 INNER JOIN categorias c ON p.id_categoria = c.id_categoria
-LEFT JOIN detalle_ventas d ON p.id_producto = d.id_producto
-LEFT JOIN ventas v ON d.id_venta = v.id_venta AND v.estado <> 'Cancelado'
+LEFT JOIN (detalle_ventas d
+           INNER JOIN ventas v ON d.id_venta = v.id_venta AND v.estado <> 'Cancelado')
+       ON p.id_producto = d.id_producto
 GROUP BY p.id_producto, p.sku, p.nombre, c.nombre, p.costo, p.precio
 ORDER BY beneficio_total_acumulado DESC, margen_rentabilidad_pct DESC;
 
@@ -435,22 +464,33 @@ ORDER BY dias_promedio_entre_compras ASC;
 -- -----------------------------------------------------------------------------
 -- 18. Productos Más Vistos vs. Comprados:
 -- Comparar los productos más visitados con los más comprados (Tasa de Conversión).
+-- Las visitas salen de producto_vistas y las compras de detalle_ventas, cada una
+-- en su propia subconsulta para no multiplicar filas entre sí.
 -- -----------------------------------------------------------------------------
 SELECT 
     p.id_producto,
     p.sku,
     p.nombre AS producto,
     c.nombre AS categoria,
-    p.vistas AS visitas_totales,
-    COALESCE(SUM(d.cantidad), 0) AS unidades_compradas,
+    COALESCE(pv.visitas, 0) AS visitas_totales,
+    COALESCE(vt.unidades, 0) AS unidades_compradas,
     ROUND(
-        (COALESCE(SUM(d.cantidad), 0) / NULLIF(p.vistas, 0)) * 100, 
+        (COALESCE(vt.unidades, 0) / NULLIF(pv.visitas, 0)) * 100, 
     2) AS tasa_conversion_visita_a_compra_pct
 FROM productos p
 INNER JOIN categorias c ON p.id_categoria = c.id_categoria
-LEFT JOIN detalle_ventas d ON p.id_producto = d.id_producto
-LEFT JOIN ventas v ON d.id_venta = v.id_venta AND v.estado <> 'Cancelado'
-GROUP BY p.id_producto, p.sku, p.nombre, c.nombre, p.vistas
+LEFT JOIN (
+    SELECT id_producto, COUNT(*) AS visitas
+    FROM producto_vistas
+    GROUP BY id_producto
+) pv ON p.id_producto = pv.id_producto
+LEFT JOIN (
+    SELECT d.id_producto, SUM(d.cantidad) AS unidades
+    FROM detalle_ventas d
+    INNER JOIN ventas v ON d.id_venta = v.id_venta
+    WHERE v.estado <> 'Cancelado'
+    GROUP BY d.id_producto
+) vt ON p.id_producto = vt.id_producto
 ORDER BY tasa_conversion_visita_a_compra_pct DESC, visitas_totales DESC;
 
 

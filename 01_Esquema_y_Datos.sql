@@ -1,8 +1,11 @@
 -- ============================================================================
--- 01_Esquema_y_Datos.sql
+-- 01_Esquema_y_Datos.sql   (VERSIÓN CORREGIDA)
 -- Proyecto: Base de Datos para un E-commerce
 -- Contenido: Creación de la estructura completa (CREATE TABLE) y carga de
 --            datos de ejemplo (INSERT INTO). Motor objetivo: MySQL 8.0+
+--
+-- ORDEN DE EJECUCIÓN RECOMENDADO: 01 -> 03 -> 05 -> 07 -> 06 -> 04 -> 02
+--
 -- ============================================================================
 
 CREATE DATABASE IF NOT EXISTS ecommerce_db
@@ -14,10 +17,42 @@ USE ecommerce_db;
 SET FOREIGN_KEY_CHECKS = 0;
 
 -- ----------------------------------------------------------------------------
--- Limpieza (permite re-ejecutar el script sin errores)
+-- Limpieza (permite re-ejecutar el script sin errores).
+-- Incluye las tablas que crean 05 y 06 para que un re-despliegue parta de cero
+-- y no queden tablas viejas con estructura distinta.
 -- ----------------------------------------------------------------------------
+-- Tablas creadas por 06_Eventos.sql
+DROP TABLE IF EXISTS staging_limpieza_temp;
+DROP TABLE IF EXISTS vm_resumen_categoria;
+DROP TABLE IF EXISTS backup_logico_ventas;
+DROP TABLE IF EXISTS log_inconsistencias_datos;
+DROP TABLE IF EXISTS historial_logs_archivo;
+DROP TABLE IF EXISTS cupones_cumpleanos;
+DROP TABLE IF EXISTS log_tamano_bd;
+DROP TABLE IF EXISTS ranking_productos;
+DROP TABLE IF EXISTS reorden_inventario;
+DROP TABLE IF EXISTS resumen_ventas_diarias;
+DROP TABLE IF EXISTS reporte_ventas_semanales;
+DROP TABLE IF EXISTS reporte_rendimiento_proveedores;
+DROP TABLE IF EXISTS kpis_mensuales;
 DROP TABLE IF EXISTS alertas_fraude;
+-- Tablas creadas por 05_Triggers.sql
+DROP TABLE IF EXISTS asignaciones_roles;
+DROP TABLE IF EXISTS auditoria_permisos;
+DROP TABLE IF EXISTS ventas_archivadas;
 DROP TABLE IF EXISTS alertas_stock;
+DROP TABLE IF EXISTS auditoria_pedidos;
+DROP TABLE IF EXISTS auditoria_clientes;
+DROP TABLE IF EXISTS log_cambios_precio;
+-- Tablas creadas por 04_Seguridad.sql
+DROP TABLE IF EXISTS log_intentos_login_fallidos;
+-- Tablas de versiones anteriores (ya no se usan)
+DROP TABLE IF EXISTS auditoria_estado_pedido;
+DROP TABLE IF EXISTS auditoria_login;
+DROP TABLE IF EXISTS tamano_bd_historico;
+-- Tablas de este script
+DROP TABLE IF EXISTS ajustes_inventario;
+DROP TABLE IF EXISTS devoluciones;
 DROP TABLE IF EXISTS resenas;
 DROP TABLE IF EXISTS referidos;
 DROP TABLE IF EXISTS producto_vistas;
@@ -25,25 +60,34 @@ DROP TABLE IF EXISTS detalle_carrito;
 DROP TABLE IF EXISTS carritos;
 DROP TABLE IF EXISTS promociones;
 DROP TABLE IF EXISTS tasas_cambio;
-DROP TABLE IF EXISTS auditoria_estado_pedido;
-DROP TABLE IF EXISTS auditoria_clientes;
-DROP TABLE IF EXISTS auditoria_login;
-DROP TABLE IF EXISTS auditoria_permisos;
-DROP TABLE IF EXISTS ventas_archivadas;
-DROP TABLE IF EXISTS kpis_mensuales;
-DROP TABLE IF EXISTS tamano_bd_historico;
-DROP TABLE IF EXISTS reporte_rendimiento_proveedores;
 DROP TABLE IF EXISTS detalle_ventas;
 DROP TABLE IF EXISTS ventas;
 DROP TABLE IF EXISTS productos;
 DROP TABLE IF EXISTS proveedores;
 DROP TABLE IF EXISTS categorias;
 DROP TABLE IF EXISTS clientes;
--- Las tablas log_cambios_precio y reporte_ventas_semanales se crean en
--- 05_Triggers.sql y 06_Eventos.sql respectivamente, tal como lo pide el
--- enunciado del proyecto.
-DROP TABLE IF EXISTS log_cambios_precio;
-DROP TABLE IF EXISTS reporte_ventas_semanales;
+DROP TABLE IF EXISTS usuario_sucursal;
+DROP TABLE IF EXISTS sucursales;
+
+-- ----------------------------------------------------------------------------
+-- Entidad: Sucursales
+-- ----------------------------------------------------------------------------
+CREATE TABLE sucursales (
+    id_sucursal INT AUTO_INCREMENT PRIMARY KEY,
+    nombre      VARCHAR(100) NOT NULL UNIQUE,
+    ciudad      VARCHAR(100) NOT NULL,
+    activa      BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+-- Mapeo usuario MySQL -> sucursal (para la seguridad a nivel de fila en 04)
+CREATE TABLE usuario_sucursal (
+    id_usuario_sucursal INT AUTO_INCREMENT PRIMARY KEY,
+    username            VARCHAR(100) NOT NULL,
+    id_sucursal         INT NOT NULL,
+    UNIQUE KEY uq_usuario_sucursal (username, id_sucursal),
+    CONSTRAINT fk_ussuc_sucursal FOREIGN KEY (id_sucursal)
+        REFERENCES sucursales(id_sucursal) ON DELETE CASCADE
+);
 
 -- ----------------------------------------------------------------------------
 -- Entidad: Categorías
@@ -76,13 +120,19 @@ CREATE TABLE clientes (
     contrasena_hash   VARCHAR(255) NOT NULL,
     direccion_envio   VARCHAR(255),
     ciudad            VARCHAR(100),
+    pais              VARCHAR(100) NOT NULL DEFAULT 'Colombia',
     fecha_nacimiento  DATE NULL,
     id_sucursal       INT NULL,
+    id_referido_por   INT NULL,
     fecha_registro    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     total_gastado     DECIMAL(12,2) NOT NULL DEFAULT 0,
-    nivel_lealtad     ENUM('Bronce','Plata','Oro') NOT NULL DEFAULT 'Bronce',
+    nivel_lealtad     ENUM('Bronce','Plata','Oro','Platino') NOT NULL DEFAULT 'Bronce',
     fecha_ultimo_pedido DATETIME NULL,
-    activo            BOOLEAN NOT NULL DEFAULT TRUE
+    activo            BOOLEAN NOT NULL DEFAULT TRUE,
+    CONSTRAINT fk_cliente_sucursal FOREIGN KEY (id_sucursal)
+        REFERENCES sucursales(id_sucursal) ON DELETE SET NULL,
+    CONSTRAINT fk_cliente_referido_por FOREIGN KEY (id_referido_por)
+        REFERENCES clientes(id_cliente) ON DELETE SET NULL
 );
 
 -- ----------------------------------------------------------------------------
@@ -95,9 +145,10 @@ CREATE TABLE productos (
     precio            DECIMAL(10,2) NOT NULL,
     costo             DECIMAL(10,2) NOT NULL,
     stock             INT NOT NULL DEFAULT 0,
-    stock_minimo      INT NOT NULL DEFAULT 5,
+    umbral_minimo     INT NOT NULL DEFAULT 5,
     peso_kg           DECIMAL(6,2) NOT NULL DEFAULT 0.50,
     sku               VARCHAR(50) NOT NULL UNIQUE,
+    vistas            INT NOT NULL DEFAULT 0,
     id_categoria      INT NULL,
     id_proveedor      INT NULL,
     fecha_creacion    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -126,7 +177,9 @@ CREATE TABLE ventas (
     eliminado       BOOLEAN NOT NULL DEFAULT FALSE,
     fecha_eliminacion DATETIME NULL,
     CONSTRAINT fk_venta_cliente FOREIGN KEY (id_cliente)
-        REFERENCES clientes(id_cliente) ON DELETE RESTRICT
+        REFERENCES clientes(id_cliente) ON DELETE RESTRICT,
+    CONSTRAINT fk_venta_sucursal FOREIGN KEY (id_sucursal)
+        REFERENCES sucursales(id_sucursal) ON DELETE SET NULL
 );
 
 -- ----------------------------------------------------------------------------
@@ -146,8 +199,7 @@ CREATE TABLE detalle_ventas (
 );
 
 -- ----------------------------------------------------------------------------
--- Tablas de apoyo (requeridas por las consultas, triggers, eventos y SPs
--- descritos en el enunciado del proyecto)
+-- Tablas de apoyo (requeridas por las consultas, triggers, eventos y SPs)
 -- ----------------------------------------------------------------------------
 
 -- Carritos de compra (para el análisis de carritos abandonados)
@@ -233,110 +285,57 @@ CREATE TABLE tasas_cambio (
     UNIQUE KEY uq_par_monedas (moneda_origen, moneda_destino)
 );
 
--- Alertas de stock bajo
-CREATE TABLE alertas_stock (
-    id_alerta    INT AUTO_INCREMENT PRIMARY KEY,
-    id_producto  INT NOT NULL,
-    mensaje      VARCHAR(255) NOT NULL,
-    fecha_alerta DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    atendida     BOOLEAN NOT NULL DEFAULT FALSE,
-    CONSTRAINT fk_alerta_producto FOREIGN KEY (id_producto)
+-- Devoluciones (usada por sp_ProcesarDevolucion)
+CREATE TABLE devoluciones (
+    id_devolucion    INT AUTO_INCREMENT PRIMARY KEY,
+    id_venta         INT NOT NULL,
+    id_producto      INT NOT NULL,
+    cantidad         INT NOT NULL,
+    motivo           TEXT NULL,
+    monto_credito    DECIMAL(12,2) NOT NULL,
+    fecha_devolucion DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT chk_devolucion_cantidad CHECK (cantidad > 0),
+    CONSTRAINT fk_devolucion_venta FOREIGN KEY (id_venta)
+        REFERENCES ventas(id_venta) ON DELETE CASCADE,
+    CONSTRAINT fk_devolucion_producto FOREIGN KEY (id_producto)
         REFERENCES productos(id_producto) ON DELETE CASCADE
 );
 
--- Alertas de fraude
-CREATE TABLE alertas_fraude (
-    id_alerta_fraude INT AUTO_INCREMENT PRIMARY KEY,
-    id_cliente       INT NOT NULL,
-    descripcion      VARCHAR(255) NOT NULL,
-    fecha            DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT fk_fraude_cliente FOREIGN KEY (id_cliente)
-        REFERENCES clientes(id_cliente) ON DELETE CASCADE
+-- Ajustes manuales de inventario (usada por sp_AjustarNivelStock)
+CREATE TABLE ajustes_inventario (
+    id_ajuste      INT AUTO_INCREMENT PRIMARY KEY,
+    id_producto    INT NOT NULL,
+    stock_anterior INT NOT NULL,
+    nuevo_stock    INT NOT NULL,
+    motivo         VARCHAR(255) NULL,
+    usuario        VARCHAR(100) NOT NULL,
+    fecha_ajuste   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_ajuste_producto FOREIGN KEY (id_producto)
+        REFERENCES productos(id_producto) ON DELETE CASCADE
 );
 
--- Auditoría: nuevos clientes
-CREATE TABLE auditoria_clientes (
-    id_auditoria INT AUTO_INCREMENT PRIMARY KEY,
-    id_cliente   INT NOT NULL,
-    accion       VARCHAR(50) NOT NULL,
-    fecha        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
--- Auditoría: intentos de inicio de sesión
-CREATE TABLE auditoria_login (
-    id_intento INT AUTO_INCREMENT PRIMARY KEY,
-    usuario    VARCHAR(150) NOT NULL,
-    exitoso    BOOLEAN NOT NULL,
-    fecha      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    ip_origen  VARCHAR(45) NULL
-);
-
--- Auditoría: cambios de permisos
-CREATE TABLE auditoria_permisos (
-    id_auditoria     INT AUTO_INCREMENT PRIMARY KEY,
-    usuario_afectado VARCHAR(150) NOT NULL,
-    accion           VARCHAR(255) NOT NULL,
-    fecha            DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
--- Auditoría: cambios de estado de pedido
-CREATE TABLE auditoria_estado_pedido (
-    id_auditoria    INT AUTO_INCREMENT PRIMARY KEY,
-    id_venta        INT NOT NULL,
-    estado_anterior VARCHAR(30) NOT NULL,
-    estado_nuevo    VARCHAR(30) NOT NULL,
-    fecha           DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT fk_auditoria_venta FOREIGN KEY (id_venta)
-        REFERENCES ventas(id_venta) ON DELETE CASCADE
-);
-
--- Archivo de ventas eliminadas
-CREATE TABLE ventas_archivadas (
-    id_archivo       INT AUTO_INCREMENT PRIMARY KEY,
-    id_venta_original INT NOT NULL,
-    id_cliente       INT NOT NULL,
-    fecha_venta      DATETIME NOT NULL,
-    estado           VARCHAR(30) NOT NULL,
-    total            DECIMAL(12,2) NOT NULL,
-    fecha_archivo    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
--- KPIs mensuales calculados
-CREATE TABLE kpis_mensuales (
-    id_kpi          INT AUTO_INCREMENT PRIMARY KEY,
-    anio            INT NOT NULL,
-    mes             INT NOT NULL,
-    ventas_totales  DECIMAL(14,2) NOT NULL DEFAULT 0,
-    nuevos_clientes INT NOT NULL DEFAULT 0,
-    ticket_promedio DECIMAL(12,2) NOT NULL DEFAULT 0,
-    fecha_calculo   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE KEY uq_anio_mes (anio, mes)
-);
-
--- Historial de tamaño de la base de datos
-CREATE TABLE tamano_bd_historico (
-    id_registro INT AUTO_INCREMENT PRIMARY KEY,
-    fecha       DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    tamano_mb   DECIMAL(12,2) NOT NULL
-);
-
--- Reporte de rendimiento de proveedores
-CREATE TABLE reporte_rendimiento_proveedores (
-    id_reporte     INT AUTO_INCREMENT PRIMARY KEY,
-    id_proveedor   INT NOT NULL,
-    anio           INT NOT NULL,
-    mes            INT NOT NULL,
-    total_vendido  DECIMAL(14,2) NOT NULL DEFAULT 0,
-    fecha_generacion DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT fk_reporte_proveedor FOREIGN KEY (id_proveedor)
-        REFERENCES proveedores(id_proveedor) ON DELETE CASCADE
-);
+-- NOTA: alertas_stock, alertas_fraude, auditoria_clientes, auditoria_permisos,
+-- ventas_archivadas, kpis_mensuales y reporte_rendimiento_proveedores se crean
+-- UNA sola vez, en 05_Triggers.sql o 06_Eventos.sql.
 
 SET FOREIGN_KEY_CHECKS = 1;
 
 -- ============================================================================
 -- DATOS DE EJEMPLO
 -- ============================================================================
+
+-- Sucursales
+INSERT INTO sucursales (nombre, ciudad) VALUES
+('Sucursal Bucaramanga', 'Bucaramanga'),
+('Sucursal Bogotá', 'Bogotá'),
+('Sucursal Cali', 'Cali');
+
+-- Usuarios de MySQL asociados a una sucursal (ver 04_Seguridad.sql, paso 19)
+INSERT INTO usuario_sucursal (username, id_sucursal) VALUES
+('support_user', 1),
+('marketing_user', 1),
+('inventory_user', 2),
+('analista_user', 3);
 
 -- Categorías
 INSERT INTO categorias (nombre, descripcion) VALUES
@@ -354,15 +353,15 @@ INSERT INTO proveedores (nombre, email_contacto, telefono_contacto) VALUES
 ('DeporMax', 'contacto@deportmax.com', '3034567890');
 
 -- Clientes
-INSERT INTO clientes (nombre, apellido, email, contrasena_hash, direccion_envio, ciudad, fecha_nacimiento, id_sucursal, total_gastado, nivel_lealtad) VALUES
-('Laura', 'Gómez', 'laura.gomez@correo.com', SHA2('clave123', 256), 'Cra 10 #20-30', 'Bucaramanga', '1995-03-14', 1, 0, 'Bronce'),
-('Carlos', 'Ramírez', 'carlos.ramirez@correo.com', SHA2('clave123', 256), 'Cll 45 #12-08', 'Bogotá', '1988-07-22', 2, 0, 'Bronce'),
-('Mariana', 'Torres', 'mariana.torres@correo.com', SHA2('clave123', 256), 'Av 30 #5-40', 'Medellín', '1992-11-02', 1, 0, 'Bronce'),
-('Andrés', 'López', 'andres.lopez@correo.com', SHA2('clave123', 256), 'Cra 7 #80-15', 'Cali', '1999-01-30', 3, 0, 'Bronce'),
-('Sofía', 'Martínez', 'sofia.martinez@correo.com', SHA2('clave123', 256), 'Cll 100 #10-20', 'Bucaramanga', '1990-05-18', 1, 0, 'Bronce');
+INSERT INTO clientes (nombre, apellido, email, contrasena_hash, direccion_envio, ciudad, pais, fecha_nacimiento, id_sucursal, total_gastado, nivel_lealtad) VALUES
+('Laura', 'Gómez', 'laura.gomez@correo.com', SHA2('clave123', 256), 'Cra 10 #20-30', 'Bucaramanga', 'Colombia', '1995-03-14', 1, 0, 'Bronce'),
+('Carlos', 'Ramírez', 'carlos.ramirez@correo.com', SHA2('clave123', 256), 'Cll 45 #12-08', 'Bogotá', 'Colombia', '1988-07-22', 2, 0, 'Bronce'),
+('Mariana', 'Torres', 'mariana.torres@correo.com', SHA2('clave123', 256), 'Av 30 #5-40', 'Medellín', 'Colombia', '1992-11-02', 1, 0, 'Bronce'),
+('Andrés', 'López', 'andres.lopez@correo.com', SHA2('clave123', 256), 'Cra 7 #80-15', 'Cali', 'Colombia', '1999-01-30', 3, 0, 'Bronce'),
+('Sofía', 'Martínez', 'sofia.martinez@correo.com', SHA2('clave123', 256), 'Cll 100 #10-20', 'Bucaramanga', 'Colombia', '1990-05-18', 1, 0, 'Bronce');
 
 -- Productos
-INSERT INTO productos (nombre, descripcion, precio, costo, stock, stock_minimo, peso_kg, sku, id_categoria, id_proveedor) VALUES
+INSERT INTO productos (nombre, descripcion, precio, costo, stock, umbral_minimo, peso_kg, sku, id_categoria, id_proveedor) VALUES
 ('Audífonos Bluetooth X200', 'Audífonos inalámbricos con cancelación de ruido', 149900, 80000, 40, 10, 0.30, 'ELEC-001', 1, 1),
 ('Smartwatch FitPro', 'Reloj inteligente con monitor de ritmo cardíaco', 289900, 150000, 25, 8, 0.15, 'ELEC-002', 1, 1),
 ('Camiseta Deportiva DryFit', 'Camiseta transpirable para entrenamiento', 59900, 22000, 100, 20, 0.20, 'ROPA-001', 2, 2),
@@ -375,11 +374,12 @@ INSERT INTO productos (nombre, descripcion, precio, costo, stock, stock_minimo, 
 ('Pantalón Jogger', 'Pantalón deportivo cómodo y ligero', 89900, 34000, 70, 15, 0.35, 'ROPA-003', 2, 2);
 
 -- Ventas y detalle de ventas (datos de ejemplo)
+-- Venta 4: 189.900 + 59.900 + 79.900 = 329.700 (antes decía 279.800)
 INSERT INTO ventas (id_cliente, id_sucursal, fecha_venta, estado, total) VALUES
 (1, 1, '2026-06-05 10:15:00', 'Entregado', 209800),
 (2, 2, '2026-06-10 14:30:00', 'Entregado', 289900),
 (1, 1, '2026-07-02 09:00:00', 'Entregado', 149900),
-(3, 1, '2026-07-15 16:45:00', 'Enviado', 279800),
+(3, 1, '2026-07-15 16:45:00', 'Enviado', 329700),
 (4, 3, '2026-08-01 11:20:00', 'Procesando', 99900),
 (5, 1, '2026-08-20 13:10:00', 'Pendiente de Pago', 159800),
 (2, 2, '2026-09-01 10:00:00', 'Entregado', 219900),
@@ -429,3 +429,43 @@ INSERT INTO tasas_cambio (moneda_origen, moneda_destino, tasa) VALUES
 INSERT INTO resenas (id_producto, id_cliente, calificacion, comentario) VALUES
 (1, 1, 5, 'Excelente calidad de sonido.'),
 (2, 2, 4, 'Muy buena batería, cómodo de usar.');
+
+-- ============================================================================
+-- SINCRONIZACIÓN INICIAL
+-- Los datos de ejemplo se cargan ANTES de que existan los triggers (05), así que
+-- se calculan aquí los valores que los triggers mantendrían automáticamente.
+-- Reproduce las mismas reglas que los triggers:
+--   * el stock se descuenta por cada línea de detalle (trg_update_stock_after_insert_venta)
+--   * total_gastado suma las ventas no canceladas
+--   * fecha_ultimo_pedido es la fecha de la venta más reciente
+-- Umbrales de lealtad en COP (los mismos de fn_DeterminarEstadoLealtad en 03):
+--   Plata >= 500.000 | Oro >= 1.500.000 | Platino >= 3.000.000
+-- ============================================================================
+UPDATE productos p
+SET p.stock = p.stock - COALESCE(
+        (SELECT SUM(d.cantidad) FROM detalle_ventas d WHERE d.id_producto = p.id_producto), 0)
+WHERE p.id_producto > 0;
+
+UPDATE productos p
+SET p.vistas = (SELECT COUNT(*) FROM producto_vistas pv WHERE pv.id_producto = p.id_producto)
+WHERE p.id_producto > 0;
+
+UPDATE categorias c
+SET c.total_productos = (SELECT COUNT(*) FROM productos p WHERE p.id_categoria = c.id_categoria)
+WHERE c.id_categoria > 0;
+
+UPDATE clientes c
+SET c.total_gastado = COALESCE(
+        (SELECT SUM(v.total) FROM ventas v
+         WHERE v.id_cliente = c.id_cliente AND v.estado <> 'Cancelado'), 0),
+    c.fecha_ultimo_pedido = (SELECT MAX(v.fecha_venta) FROM ventas v WHERE v.id_cliente = c.id_cliente)
+WHERE c.id_cliente > 0;
+
+UPDATE clientes c
+SET c.nivel_lealtad = CASE
+        WHEN c.total_gastado >= 3000000 THEN 'Platino'
+        WHEN c.total_gastado >= 1500000 THEN 'Oro'
+        WHEN c.total_gastado >=  500000 THEN 'Plata'
+        ELSE 'Bronce'
+    END
+WHERE c.id_cliente > 0;

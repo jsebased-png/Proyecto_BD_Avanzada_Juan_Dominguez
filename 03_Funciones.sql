@@ -18,7 +18,6 @@ DROP FUNCTION IF EXISTS fn_CalcularTotalVenta//
 CREATE FUNCTION fn_CalcularTotalVenta(p_id_venta INT) 
 RETURNS DECIMAL(12,2)
 READS SQL DATA
-DETERMINISTIC
 BEGIN
     DECLARE v_total DECIMAL(12,2);
     SELECT COALESCE(SUM(cantidad * precio_unitario_congelado), 0.00)
@@ -37,7 +36,6 @@ DROP FUNCTION IF EXISTS fn_VerificarDisponibilidadStock//
 CREATE FUNCTION fn_VerificarDisponibilidadStock(p_id_producto INT, p_cantidad INT) 
 RETURNS BOOLEAN
 READS SQL DATA
-DETERMINISTIC
 BEGIN
     DECLARE v_stock INT DEFAULT 0;
     SELECT stock INTO v_stock
@@ -60,7 +58,6 @@ DROP FUNCTION IF EXISTS fn_ObtenerPrecioProducto//
 CREATE FUNCTION fn_ObtenerPrecioProducto(p_id_producto INT) 
 RETURNS DECIMAL(10,2)
 READS SQL DATA
-DETERMINISTIC
 BEGIN
     DECLARE v_precio DECIMAL(10,2) DEFAULT 0.00;
     SELECT precio INTO v_precio
@@ -78,7 +75,6 @@ DROP FUNCTION IF EXISTS fn_CalcularEdadCliente//
 CREATE FUNCTION fn_CalcularEdadCliente(p_fecha_nacimiento DATE) 
 RETURNS INT
 NO SQL
-DETERMINISTIC
 BEGIN
     IF p_fecha_nacimiento IS NULL THEN
         RETURN NULL;
@@ -115,7 +111,6 @@ DROP FUNCTION IF EXISTS fn_EsClienteNuevo//
 CREATE FUNCTION fn_EsClienteNuevo(p_id_cliente INT) 
 RETURNS BOOLEAN
 READS SQL DATA
-DETERMINISTIC
 BEGIN
     DECLARE v_primera_compra DATETIME;
     SELECT MIN(fecha_venta) INTO v_primera_compra
@@ -133,13 +128,12 @@ END//
 -- -----------------------------------------------------------------------------
 -- 7. fn_CalcularCostoEnvio
 -- Calcula el costo de envío basado en el peso total acumulado de una venta.
--- Tarifa: Base de $5.00 + $2.50 por kg adicional.
+-- Tarifa en COP: Base de $12.000 (hasta 1 kg) + $4.000 por cada kg adicional.
 -- -----------------------------------------------------------------------------
 DROP FUNCTION IF EXISTS fn_CalcularCostoEnvio//
 CREATE FUNCTION fn_CalcularCostoEnvio(p_id_venta INT) 
 RETURNS DECIMAL(10,2)
 READS SQL DATA
-DETERMINISTIC
 BEGIN
     DECLARE v_peso_total DECIMAL(10,2) DEFAULT 0.00;
     DECLARE v_costo_envio DECIMAL(10,2);
@@ -151,9 +145,9 @@ BEGIN
     WHERE d.id_venta = p_id_venta;
     
     IF v_peso_total <= 1.00 THEN
-        SET v_costo_envio = 5.00;
+        SET v_costo_envio = 12000.00;
     ELSE
-        SET v_costo_envio = 5.00 + ((v_peso_total - 1.00) * 2.50);
+        SET v_costo_envio = 12000.00 + ((v_peso_total - 1.00) * 4000.00);
     END IF;
     
     RETURN ROUND(v_costo_envio, 2);
@@ -185,7 +179,6 @@ DROP FUNCTION IF EXISTS fn_ObtenerUltimaFechaCompra//
 CREATE FUNCTION fn_ObtenerUltimaFechaCompra(p_id_cliente INT) 
 RETURNS DATETIME
 READS SQL DATA
-DETERMINISTIC
 BEGIN
     DECLARE v_ultima_fecha DATETIME;
     SELECT MAX(fecha_venta) INTO v_ultima_fecha
@@ -221,7 +214,6 @@ DROP FUNCTION IF EXISTS fn_ObtenerNombreCategoria//
 CREATE FUNCTION fn_ObtenerNombreCategoria(p_id_producto INT) 
 RETURNS VARCHAR(100)
 READS SQL DATA
-DETERMINISTIC
 BEGIN
     DECLARE v_categoria VARCHAR(100);
     SELECT c.nombre INTO v_categoria
@@ -240,7 +232,6 @@ DROP FUNCTION IF EXISTS fn_ContarVentasCliente//
 CREATE FUNCTION fn_ContarVentasCliente(p_id_cliente INT) 
 RETURNS INT
 READS SQL DATA
-DETERMINISTIC
 BEGIN
     DECLARE v_conteo INT DEFAULT 0;
     SELECT COUNT(*) INTO v_conteo
@@ -258,7 +249,6 @@ DROP FUNCTION IF EXISTS fn_CalcularDiasDesdeUltimaCompra//
 CREATE FUNCTION fn_CalcularDiasDesdeUltimaCompra(p_id_cliente INT) 
 RETURNS INT
 READS SQL DATA
-DETERMINISTIC
 BEGIN
     DECLARE v_fecha DATETIME;
     SELECT MAX(fecha_venta) INTO v_fecha
@@ -274,7 +264,8 @@ END//
 
 -- -----------------------------------------------------------------------------
 -- 14. fn_DeterminarEstadoLealtad
--- Asigna un estado de lealtad (Bronce, Plata, Oro, Platino) según gasto total.
+-- Asigna un estado de lealtad (Bronce, Plata, Oro, Platino) según gasto total en COP.
+-- Umbrales: Plata >= 1.000.000 | Oro >= 2.500.000 | Platino >= 5.000.000
 -- -----------------------------------------------------------------------------
 DROP FUNCTION IF EXISTS fn_DeterminarEstadoLealtad//
 CREATE FUNCTION fn_DeterminarEstadoLealtad(p_total_gastado DECIMAL(12,2)) 
@@ -282,11 +273,11 @@ RETURNS VARCHAR(20)
 NO SQL
 DETERMINISTIC
 BEGIN
-    IF p_total_gastado >= 5000.00 THEN
+    IF p_total_gastado >= 5000000.00 THEN
         RETURN 'Platino';
-    ELSEIF p_total_gastado >= 2500.00 THEN
+    ELSEIF p_total_gastado >= 2500000.00 THEN
         RETURN 'Oro';
-    ELSEIF p_total_gastado >= 1000.00 THEN
+    ELSEIF p_total_gastado >= 1000000.00 THEN
         RETURN 'Plata';
     ELSE
         RETURN 'Bronce';
@@ -302,11 +293,13 @@ DROP FUNCTION IF EXISTS fn_GenerarSKU//
 CREATE FUNCTION fn_GenerarSKU(p_nombre VARCHAR(150), p_id_categoria INT) 
 RETURNS VARCHAR(50)
 READS SQL DATA
-DETERMINISTIC
 BEGIN
     DECLARE v_prefijo_cat VARCHAR(10);
     DECLARE v_prefijo_nom VARCHAR(10);
     DECLARE v_aleatorio INT;
+    DECLARE v_sku VARCHAR(50);
+    DECLARE v_existe INT DEFAULT 1;
+    DECLARE v_intentos INT DEFAULT 0;
     
     SELECT UPPER(SUBSTRING(REGEXP_REPLACE(nombre, '[^A-Za-z]', ''), 1, 3))
     INTO v_prefijo_cat
@@ -322,9 +315,20 @@ BEGIN
         SET v_prefijo_nom = 'PRD';
     END IF;
     
-    SET v_aleatorio = FLOOR(100 + (RAND() * 899));
+    -- Reintenta hasta encontrar un SKU que no exista en productos (sku es UNIQUE).
+    WHILE v_existe > 0 AND v_intentos < 50 DO
+        SET v_aleatorio = FLOOR(100 + (RAND() * 899));
+        SET v_sku = CONCAT(v_prefijo_cat, '-', v_prefijo_nom, '-', v_aleatorio);
+        SELECT COUNT(*) INTO v_existe FROM productos WHERE sku = v_sku;
+        SET v_intentos = v_intentos + 1;
+    END WHILE;
     
-    RETURN CONCAT(v_prefijo_cat, '-', v_prefijo_nom, '-', v_aleatorio);
+    -- Si el espacio de 899 sufijos está saturado, se amplía con un sufijo largo.
+    IF v_existe > 0 THEN
+        SET v_sku = CONCAT(v_prefijo_cat, '-', v_prefijo_nom, '-', FLOOR(RAND() * 900000) + 100000);
+    END IF;
+    
+    RETURN v_sku;
 END//
 
 
@@ -353,7 +357,6 @@ DROP FUNCTION IF EXISTS fn_ObtenerStockTotalPorCategoria//
 CREATE FUNCTION fn_ObtenerStockTotalPorCategoria(p_id_categoria INT) 
 RETURNS INT
 READS SQL DATA
-DETERMINISTIC
 BEGIN
     DECLARE v_stock_total INT DEFAULT 0;
     SELECT COALESCE(SUM(stock), 0) INTO v_stock_total
@@ -398,7 +401,7 @@ END//
 -- Convierte un valor monetario a otra divisa utilizando una tasa de cambio fija.
 -- -----------------------------------------------------------------------------
 DROP FUNCTION IF EXISTS fn_ConvertirMoneda//
-CREATE FUNCTION fn_ConvertirMoneda(p_monto DECIMAL(12,2), p_tasa_cambio DECIMAL(10,4)) 
+CREATE FUNCTION fn_ConvertirMoneda(p_monto DECIMAL(12,2), p_tasa_cambio DECIMAL(12,6)) 
 RETURNS DECIMAL(12,2)
 NO SQL
 DETERMINISTIC
@@ -411,47 +414,39 @@ END//
 
 
 -- -----------------------------------------------------------------------------
--- 20. fn_ValidarComplejidadContraseña
+-- 20. fn_ValidarComplejidadContrasena
 -- Verifica si una contraseña cumple con requisitos de longitud (>=8),
 -- al menos una mayúscula, una minúscula y un número.
+-- Se usa el nombre SIN ñ para evitar problemas de codificación del cliente.
+-- REGEXP_LIKE con 'c' fuerza distinción de mayúsculas/minúsculas aunque la
+-- collation de la base sea _ci (insensible).
 -- -----------------------------------------------------------------------------
-DROP FUNCTION IF EXISTS fn_ValidarComplejidadContraseña//
-CREATE FUNCTION fn_ValidarComplejidadContraseña(p_contrasena VARCHAR(255)) 
-RETURNS BOOLEAN
-NO SQL
-DETERMINISTIC
-BEGIN
-    IF CHAR_LENGTH(p_contrasena) < 8 THEN
-        RETURN FALSE;
-    END IF;
-    
-    -- Debe contener al menos una mayúscula
-    IF NOT p_contrasena REGEXP '[A-Z]' THEN
-        RETURN FALSE;
-    END IF;
-    
-    -- Debe contener al menos una minúscula
-    IF NOT p_contrasena REGEXP '[a-z]' THEN
-        RETURN FALSE;
-    END IF;
-    
-    -- Debe contener al menos un dígito
-    IF NOT p_contrasena REGEXP '[0-9]' THEN
-        RETURN FALSE;
-    END IF;
-    
-    RETURN TRUE;
-END//
-
--- Alias de compatibilidad sin tilde/eñe:
 DROP FUNCTION IF EXISTS fn_ValidarComplejidadContrasena//
 CREATE FUNCTION fn_ValidarComplejidadContrasena(p_contrasena VARCHAR(255)) 
 RETURNS BOOLEAN
 NO SQL
 DETERMINISTIC
 BEGIN
-    RETURN fn_ValidarComplejidadContraseña(p_contrasena);
+    IF p_contrasena IS NULL OR CHAR_LENGTH(p_contrasena) < 8 THEN
+        RETURN FALSE;
+    END IF;
+    
+    -- Debe contener al menos una mayúscula
+    IF NOT REGEXP_LIKE(p_contrasena, '[A-Z]', 'c') THEN
+        RETURN FALSE;
+    END IF;
+    
+    -- Debe contener al menos una minúscula
+    IF NOT REGEXP_LIKE(p_contrasena, '[a-z]', 'c') THEN
+        RETURN FALSE;
+    END IF;
+    
+    -- Debe contener al menos un dígito
+    IF NOT REGEXP_LIKE(p_contrasena, '[0-9]', 'c') THEN
+        RETURN FALSE;
+    END IF;
+    
+    RETURN TRUE;
 END//
 
 DELIMITER ;
-

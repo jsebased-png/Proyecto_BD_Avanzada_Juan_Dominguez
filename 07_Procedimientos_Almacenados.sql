@@ -4,6 +4,10 @@
 -- DESCRIPCIÓN: 20 Procedimientos Almacenados con control transaccional,
 --              manejo de excepciones y lógica de operaciones comerciales.
 -- MOTOR: MySQL 8.0+
+-- ORDEN DE EJECUCIÓN: 01 -> 03 -> 05 -> 07 -> 06 -> 04 -> 02
+-- NOTA: este script asume el esquema unificado de 01 (umbral_minimo, pais,
+--       id_referido_por, contrasena_hash, carritos/detalle_carrito, resenas,
+--       sucursales, devoluciones, ajustes_inventario, producto_vistas).
 -- =============================================================================
 USE ecommerce_db;
 DELIMITER // -- -----------------------------------------------------------------------------
@@ -17,9 +21,10 @@ DROP PROCEDURE IF EXISTS sp_RealizarNuevaVenta // CREATE PROCEDURE sp_RealizarNu
     IN p_id_producto INT,
     IN p_cantidad INT,
     OUT p_id_venta_generada INT
-) BEGIN
-DECLARE v_stock_disponible INT DEFAULT 0;
-DECLARE v_precio_actual DECIMAL(10, 2) DEFAULT 0.00;
+) BEGIN -- Sin DEFAULT: si el SELECT ... INTO no encuentra filas, las variables
+-- quedan en NULL y el chequeo IS NULL sí funciona.
+DECLARE v_stock_disponible INT;
+DECLARE v_precio_actual DECIMAL(10, 2);
 DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ROLLBACK;
 RESIGNAL;
 END;
@@ -54,7 +59,7 @@ VALUES (
         ROUND(v_precio_actual * p_cantidad, 2)
     );
 SET p_id_venta_generada = LAST_INSERT_ID();
--- Insertar detalle de venta (el trigger decrementa stock y actualiza cliente)
+-- Insertar detalle de venta (el trigger decrementa stock y recalcula el total)
 INSERT INTO detalle_ventas (
         id_venta,
         id_producto,
@@ -122,7 +127,7 @@ VALUES (
 SET p_id_producto_creado = LAST_INSERT_ID();
 END // -- -----------------------------------------------------------------------------
 -- 3. sp_ActualizarDireccionCliente
--- Actualiza la dirección principal de envío y ciudad de un cliente.
+-- Actualiza la dirección principal de envío, ciudad y país de un cliente.
 -- -----------------------------------------------------------------------------
 DROP PROCEDURE IF EXISTS sp_ActualizarDireccionCliente // CREATE PROCEDURE sp_ActualizarDireccionCliente(
     IN p_id_cliente INT,
@@ -146,22 +151,29 @@ DROP PROCEDURE IF EXISTS sp_ProcesarDevolucion // CREATE PROCEDURE sp_ProcesarDe
     IN p_cantidad_devolver INT,
     IN p_motivo TEXT,
     OUT p_monto_credito DECIMAL(10, 2)
-) BEGIN
-DECLARE v_cantidad_comprada INT DEFAULT 0;
-DECLARE v_precio_congelado DECIMAL(10, 2) DEFAULT 0.00;
+) BEGIN -- Sin DEFAULT para que "no hay filas" quede como NULL.
+DECLARE v_cantidad_comprada INT;
+DECLARE v_precio_congelado DECIMAL(12, 4);
 DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ROLLBACK;
 RESIGNAL;
 END;
+IF p_cantidad_devolver IS NULL
+OR p_cantidad_devolver <= 0 THEN SIGNAL SQLSTATE '45000'
+SET MESSAGE_TEXT = 'Error: La cantidad a devolver debe ser mayor que cero.';
+END IF;
 START TRANSACTION;
--- Validar que el producto haya sido parte de la venta
-SELECT cantidad,
-    precio_unitario_congelado INTO v_cantidad_comprada,
+-- SUM() devuelve una sola fila aunque el producto aparezca en varias líneas
+-- de la misma venta (evita el error 1172). El precio es el promedio ponderado.
+SELECT SUM(cantidad),
+    SUM(cantidad * precio_unitario_congelado) / NULLIF(SUM(cantidad), 0) INTO v_cantidad_comprada,
     v_precio_congelado
 FROM detalle_ventas
 WHERE id_venta = p_id_venta
     AND id_producto = p_id_producto;
-IF v_cantidad_comprada IS NULL
-OR v_cantidad_comprada < p_cantidad_devolver THEN SIGNAL SQLSTATE '45000'
+IF v_cantidad_comprada IS NULL THEN SIGNAL SQLSTATE '45000'
+SET MESSAGE_TEXT = 'Error: El producto no hace parte de la venta indicada.';
+END IF;
+IF v_cantidad_comprada < p_cantidad_devolver THEN SIGNAL SQLSTATE '45000'
 SET MESSAGE_TEXT = 'Error: La cantidad a devolver excede lo registrado en la orden.';
 END IF;
 SET p_monto_credito = ROUND(v_precio_congelado * p_cantidad_devolver, 2);
@@ -190,6 +202,7 @@ COMMIT;
 END // -- -----------------------------------------------------------------------------
 -- 5. sp_ObtenerHistorialComprasCliente
 -- Devuelve el historial completo de ventas y productos adquiridos por un cliente.
+-- LEFT JOIN con sucursales: una venta sin sucursal (NULL) no debe desaparecer.
 -- -----------------------------------------------------------------------------
 DROP PROCEDURE IF EXISTS sp_ObtenerHistorialComprasCliente // CREATE PROCEDURE sp_ObtenerHistorialComprasCliente(IN p_id_cliente INT) BEGIN
 SELECT v.id_venta,
@@ -203,7 +216,7 @@ SELECT v.id_venta,
     (d.cantidad * d.precio_unitario_congelado) AS subtotal,
     v.total AS total_orden
 FROM ventas v
-    INNER JOIN sucursales s ON v.id_sucursal = s.id_sucursal
+    LEFT JOIN sucursales s ON v.id_sucursal = s.id_sucursal
     INNER JOIN detalle_ventas d ON v.id_venta = d.id_venta
     INNER JOIN productos p ON d.id_producto = p.id_producto
 WHERE v.id_cliente = p_id_cliente
@@ -219,13 +232,16 @@ DROP PROCEDURE IF EXISTS sp_AjustarNivelStock // CREATE PROCEDURE sp_AjustarNive
     IN p_motivo VARCHAR(255),
     IN p_usuario VARCHAR(100)
 ) BEGIN
-DECLARE v_stock_anterior INT DEFAULT 0;
+DECLARE v_stock_anterior INT;
 IF p_nuevo_stock < 0 THEN SIGNAL SQLSTATE '45000'
 SET MESSAGE_TEXT = 'El nuevo stock no puede ser un valor negativo.';
 END IF;
 SELECT stock INTO v_stock_anterior
 FROM productos
 WHERE id_producto = p_id_producto;
+IF v_stock_anterior IS NULL THEN SIGNAL SQLSTATE '45000'
+SET MESSAGE_TEXT = 'Error: El producto especificado no existe.';
+END IF;
 -- Registrar en tabla de ajustes de inventario
 INSERT INTO ajustes_inventario (
         id_producto,
@@ -257,8 +273,11 @@ UPDATE clientes
 SET nombre = 'Cliente',
     apellido = 'Anonimizado',
     email = CONCAT('anonimo_', p_id_cliente, '@anonimizado.local'),
-    contraseña = '$2b$12$CUENTA_ANONIMIZADA_SIN_ACCESO_LOCAL',
+    -- Hash aleatorio e irrecuperable: la cuenta queda sin acceso posible.
+    contrasena_hash = SHA2(CONCAT(UUID(), RAND()), 256),
     direccion_envio = 'DIRECCION_ANONIMIZADA',
+    ciudad = 'ANONIMIZADA',
+    pais = 'ANONIMIZADO',
     fecha_nacimiento = NULL,
     activo = FALSE
 WHERE id_cliente = p_id_cliente;
@@ -282,48 +301,90 @@ WHERE id_categoria = p_id_categoria
     AND activo = TRUE;
 END // -- -----------------------------------------------------------------------------
 -- 9. sp_GenerarReporteMensualVentas
--- Genera un reporte detallado con las métricas comerciales de un mes dado.
+-- Genera un reporte con las métricas comerciales de un mes dado.
+-- DEFINICIÓN ÚNICA (la de 04 se eliminó). Orden de parámetros: (año, mes).
+-- Los totales de ventas se calculan SIN unir con detalle_ventas (para no sumar
+-- una venta tantas veces como líneas tenga); unidades y margen van en una
+-- subconsulta aparte.
 -- -----------------------------------------------------------------------------
-DROP PROCEDURE IF EXISTS sp_GenerarReporteMensualVentas // CREATE PROCEDURE sp_GenerarReporteMensualVentas(IN p_mes INT, IN p_anio INT) BEGIN
+DROP PROCEDURE IF EXISTS sp_GenerarReporteMensualVentas // CREATE PROCEDURE sp_GenerarReporteMensualVentas(IN p_anio INT, IN p_mes INT) BEGIN
+DECLARE v_inicio DATE;
+DECLARE v_fin DATE;
+IF p_mes IS NULL
+OR p_mes < 1
+OR p_mes > 12
+OR p_anio IS NULL THEN SIGNAL SQLSTATE '45000'
+SET MESSAGE_TEXT = 'Parámetros inválidos: el mes debe estar entre 1 y 12 y el año es obligatorio.';
+END IF;
+SET v_inicio = STR_TO_DATE(CONCAT(p_anio, '-', p_mes, '-01'), '%Y-%m-%d');
+SET v_fin = DATE_ADD(v_inicio, INTERVAL 1 MONTH);
 SELECT p_anio AS anio,
     p_mes AS mes,
-    COUNT(DISTINCT v.id_venta) AS total_pedidos,
-    COUNT(DISTINCT v.id_cliente) AS clientes_unicos,
-    COALESCE(SUM(v.total), 0.00) AS ingresos_totales,
-    COALESCE(ROUND(AVG(v.total), 2), 0.00) AS ticket_promedio,
-    COALESCE(SUM(d.cantidad), 0) AS unidades_totales_vendidas,
-    COALESCE(
-        SUM(
-            d.cantidad * (d.precio_unitario_congelado - p.costo)
-        ),
-        0.00
-    ) AS margen_bruto_total
-FROM ventas v
-    LEFT JOIN detalle_ventas d ON v.id_venta = d.id_venta
-    LEFT JOIN productos p ON d.id_producto = p.id_producto
-WHERE MONTH(v.fecha_venta) = p_mes
-    AND YEAR(v.fecha_venta) = p_anio
-    AND v.estado <> 'Cancelado';
+    t.total_pedidos,
+    t.clientes_unicos,
+    t.ingresos_totales,
+    t.ticket_promedio,
+    l.unidades_totales_vendidas,
+    l.margen_bruto_total
+FROM (
+        SELECT COUNT(*) AS total_pedidos,
+            COUNT(DISTINCT v.id_cliente) AS clientes_unicos,
+            COALESCE(SUM(v.total), 0.00) AS ingresos_totales,
+            COALESCE(ROUND(AVG(v.total), 2), 0.00) AS ticket_promedio
+        FROM ventas v
+        WHERE v.fecha_venta >= v_inicio
+            AND v.fecha_venta < v_fin
+            AND v.estado <> 'Cancelado'
+    ) t
+    CROSS JOIN (
+        SELECT COALESCE(SUM(d.cantidad), 0) AS unidades_totales_vendidas,
+            COALESCE(
+                SUM(
+                    d.cantidad * (d.precio_unitario_congelado - p.costo)
+                ),
+                0.00
+            ) AS margen_bruto_total
+        FROM ventas v
+            INNER JOIN detalle_ventas d ON v.id_venta = d.id_venta
+            INNER JOIN productos p ON d.id_producto = p.id_producto
+        WHERE v.fecha_venta >= v_inicio
+            AND v.fecha_venta < v_fin
+            AND v.estado <> 'Cancelado'
+    ) l;
 END // -- -----------------------------------------------------------------------------
 -- 10. sp_CambiarEstadoPedido
 -- Cambia el estado de un pedido (ej. de 'Procesando' a 'Enviado').
+-- El parámetro es VARCHAR y se valida a mano (un ENUM como parámetro puede
+-- convertirse silenciosamente en cadena vacía según el modo SQL).
 -- -----------------------------------------------------------------------------
 DROP PROCEDURE IF EXISTS sp_CambiarEstadoPedido // CREATE PROCEDURE sp_CambiarEstadoPedido(
     IN p_id_venta INT,
-    IN p_nuevo_estado ENUM(
-        'Pendiente de Pago',
-        'Procesando',
-        'Enviado',
-        'Entregado',
-        'Cancelado'
-    )
+    IN p_nuevo_estado VARCHAR(30)
 ) BEGIN
+DECLARE v_existe INT DEFAULT 0;
+IF p_nuevo_estado IS NULL
+OR p_nuevo_estado NOT IN (
+    'Pendiente de Pago',
+    'Procesando',
+    'Enviado',
+    'Entregado',
+    'Cancelado'
+) THEN SIGNAL SQLSTATE '45000'
+SET MESSAGE_TEXT = 'Estado inválido. Valores permitidos: Pendiente de Pago, Procesando, Enviado, Entregado, Cancelado.';
+END IF;
+SELECT COUNT(*) INTO v_existe
+FROM ventas
+WHERE id_venta = p_id_venta;
+IF v_existe = 0 THEN SIGNAL SQLSTATE '45000'
+SET MESSAGE_TEXT = 'La venta especificada no existe.';
+END IF;
 UPDATE ventas
 SET estado = p_nuevo_estado
 WHERE id_venta = p_id_venta;
 END // -- -----------------------------------------------------------------------------
 -- 11. sp_RegistrarNuevoCliente
 -- Registra un nuevo cliente validando que el correo electrónico no exista.
+-- La contraseña se guarda hasheada con SHA2(...,256), igual que en 01.
 -- -----------------------------------------------------------------------------
 DROP PROCEDURE IF EXISTS sp_RegistrarNuevoCliente // CREATE PROCEDURE sp_RegistrarNuevoCliente(
     IN p_nombre VARCHAR(100),
@@ -347,7 +408,7 @@ INSERT INTO clientes (
         nombre,
         apellido,
         email,
-        contraseña,
+        contrasena_hash,
         direccion_envio,
         ciudad,
         fecha_nacimiento,
@@ -358,7 +419,7 @@ VALUES (
         p_nombre,
         p_apellido,
         p_email,
-        p_contrasena,
+        SHA2(p_contrasena, 256),
         p_direccion,
         COALESCE(p_ciudad, 'Bogotá'),
         p_fecha_nacimiento,
@@ -369,6 +430,8 @@ SET p_id_cliente_creado = LAST_INSERT_ID();
 END // -- -----------------------------------------------------------------------------
 -- 12. sp_ObtenerDetallesProductoCompleto
 -- Devuelve toda la información del producto, su categoría, proveedor y reseñas.
+-- Reseñas y vistas se calculan en subconsultas; el proveedor va con LEFT JOIN
+-- porque la FK es ON DELETE SET NULL.
 -- -----------------------------------------------------------------------------
 DROP PROCEDURE IF EXISTS sp_ObtenerDetallesProductoCompleto // CREATE PROCEDURE sp_ObtenerDetallesProductoCompleto(IN p_id_producto INT) BEGIN
 SELECT p.id_producto,
@@ -381,24 +444,33 @@ SELECT p.id_producto,
     p.stock,
     p.umbral_minimo,
     p.peso_kg,
-    p.vistas,
+    COALESCE(pv.vistas, 0) AS vistas,
     p.activo,
     c.nombre AS categoria,
     prov.nombre AS proveedor,
     prov.email_contacto AS email_proveedor,
     prov.telefono_contacto AS tel_proveedor,
-    COALESCE(ROUND(AVG(r.calificacion), 1), 0.0) AS calificacion_promedio,
-    COUNT(r.id_resena) AS total_resenas
+    COALESCE(r.calificacion_promedio, 0.0) AS calificacion_promedio,
+    COALESCE(r.total_resenas, 0) AS total_resenas
 FROM productos p
     INNER JOIN categorias c ON p.id_categoria = c.id_categoria
-    INNER JOIN proveedores prov ON p.id_proveedor = prov.id_proveedor
-    LEFT JOIN resenas_productos r ON p.id_producto = r.id_producto
-WHERE p.id_producto = p_id_producto
-GROUP BY p.id_producto,
-    c.nombre,
-    prov.nombre,
-    prov.email_contacto,
-    prov.telefono_contacto;
+    LEFT JOIN proveedores prov ON p.id_proveedor = prov.id_proveedor
+    LEFT JOIN (
+        SELECT id_producto,
+            COUNT(*) AS vistas
+        FROM producto_vistas
+        WHERE id_producto = p_id_producto
+        GROUP BY id_producto
+    ) pv ON p.id_producto = pv.id_producto
+    LEFT JOIN (
+        SELECT id_producto,
+            ROUND(AVG(calificacion), 1) AS calificacion_promedio,
+            COUNT(*) AS total_resenas
+        FROM resenas
+        WHERE id_producto = p_id_producto
+        GROUP BY id_producto
+    ) r ON p.id_producto = r.id_producto
+WHERE p.id_producto = p_id_producto;
 END // -- -----------------------------------------------------------------------------
 -- 13. sp_FusionarCuentasCliente
 -- Fusiona dos cuentas duplicadas, trasladando ventas, carritos y reseñas
@@ -419,12 +491,12 @@ START TRANSACTION;
 UPDATE ventas
 SET id_cliente = p_id_cliente_destino
 WHERE id_cliente = p_id_cliente_origen;
--- Reasignar carritos de compras
-UPDATE carrito_compras
+-- Reasignar carritos de compras (el detalle viaja con la cabecera)
+UPDATE carritos
 SET id_cliente = p_id_cliente_destino
 WHERE id_cliente = p_id_cliente_origen;
 -- Reasignar reseñas de productos
-UPDATE resenas_productos
+UPDATE resenas
 SET id_cliente = p_id_cliente_destino
 WHERE id_cliente = p_id_cliente_origen;
 -- Recalcular total gastado en cliente destino
@@ -436,9 +508,10 @@ SET total_gastado = (
             AND estado <> 'Cancelado'
     )
 WHERE id_cliente = p_id_cliente_destino;
--- Desactivar y marcar la cuenta origen
+-- Desactivar la cuenta origen, marcarla y dejar su total gastado en cero
 UPDATE clientes
 SET activo = FALSE,
+    total_gastado = 0.00,
     email = CONCAT(
         'fusionado_con_',
         p_id_cliente_destino,
@@ -486,7 +559,7 @@ SELECT p.id_producto,
     prov.nombre AS proveedor
 FROM productos p
     INNER JOIN categorias c ON p.id_categoria = c.id_categoria
-    INNER JOIN proveedores prov ON p.id_proveedor = prov.id_proveedor
+    LEFT JOIN proveedores prov ON p.id_proveedor = prov.id_proveedor
 WHERE p.activo = TRUE
     AND (
         p_termino IS NULL
@@ -506,13 +579,13 @@ WHERE p.activo = TRUE
         OR p.precio <= p_precio_max
     )
     AND (
-        p_solo_disponibles IS FALSE
+        COALESCE(p_solo_disponibles, FALSE) = FALSE
         OR p.stock > 0
     )
 ORDER BY p.precio ASC;
 END // -- -----------------------------------------------------------------------------
 -- 16. sp_ObtenerDashboardAdmin
--- Devuelve un resumen gerencial instantáneo con los principales indicadores del e-commerce.
+-- Devuelve un resumen gerencial instantáneo con los principales indicadores.
 -- -----------------------------------------------------------------------------
 DROP PROCEDURE IF EXISTS sp_ObtenerDashboardAdmin // CREATE PROCEDURE sp_ObtenerDashboardAdmin() BEGIN
 SELECT (
@@ -583,17 +656,18 @@ WHERE id_venta = p_id_venta;
 SET p_resultado = 'PAGO_CONFIRMADO_EXITOSAMENTE';
 END IF;
 END // -- -----------------------------------------------------------------------------
--- 18. sp_AñadirReseñaProducto
--- Permite registrar una calificación y reseña únicamente si el cliente
--- adquirió previamente el producto en una venta entregada.
+-- 18. sp_AnadirResenaProducto   (nombre sin tilde ni eñe a propósito)
+-- Registra una calificación y reseña únicamente si el cliente adquirió
+-- previamente el producto en una venta entregada, y una sola vez por producto.
 -- -----------------------------------------------------------------------------
-DROP PROCEDURE IF EXISTS sp_AñadirReseñaProducto // CREATE PROCEDURE sp_AñadirReseñaProducto(
+DROP PROCEDURE IF EXISTS sp_AnadirResenaProducto // CREATE PROCEDURE sp_AnadirResenaProducto(
     IN p_id_cliente INT,
     IN p_id_producto INT,
     IN p_calificacion INT,
     IN p_comentario TEXT
 ) BEGIN
 DECLARE v_comprado INT DEFAULT 0;
+DECLARE v_duplicada INT DEFAULT 0;
 IF p_calificacion < 1
 OR p_calificacion > 5 THEN SIGNAL SQLSTATE '45000'
 SET MESSAGE_TEXT = 'La calificación debe estar entre 1 y 5 estrellas.';
@@ -608,7 +682,15 @@ WHERE v.id_cliente = p_id_cliente
 IF v_comprado = 0 THEN SIGNAL SQLSTATE '45000'
 SET MESSAGE_TEXT = 'No autorizado: Solo clientes con compra entregada pueden reseñar este producto.';
 END IF;
-INSERT INTO resenas_productos (
+-- Impedir reseñas duplicadas del mismo cliente y producto
+SELECT COUNT(*) INTO v_duplicada
+FROM resenas
+WHERE id_cliente = p_id_cliente
+    AND id_producto = p_id_producto;
+IF v_duplicada > 0 THEN SIGNAL SQLSTATE '45000'
+SET MESSAGE_TEXT = 'Este cliente ya registró una reseña para este producto.';
+END IF;
+INSERT INTO resenas (
         id_producto,
         id_cliente,
         calificacion,
@@ -622,18 +704,6 @@ VALUES (
         p_comentario,
         NOW()
     );
-END // -- Alias de compatibilidad sin tilde/eñe:
-DROP PROCEDURE IF EXISTS sp_AnadirResenaProducto // CREATE PROCEDURE sp_AnadirResenaProducto(
-    IN p_id_cliente INT,
-    IN p_id_producto INT,
-    IN p_calificacion INT,
-    IN p_comentario TEXT
-) BEGIN CALL sp_AñadirReseñaProducto(
-    p_id_cliente,
-    p_id_producto,
-    p_calificacion,
-    p_comentario
-);
 END // -- -----------------------------------------------------------------------------
 -- 19. sp_ObtenerProductosRelacionados
 -- Devuelve recomendaciones de productos basadas en compras concurrentes.

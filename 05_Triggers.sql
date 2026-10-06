@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS ventas_archivadas (
     id_archivo INT AUTO_INCREMENT PRIMARY KEY,
     id_venta INT NOT NULL,
     id_cliente INT NOT NULL,
-    id_sucursal INT NOT NULL,
+    id_sucursal INT NULL,
     fecha_venta DATETIME NOT NULL,
     estado VARCHAR(50) NOT NULL,
     total DECIMAL(12,2) NOT NULL,
@@ -188,7 +188,10 @@ END//
 
 -- -----------------------------------------------------------------------------
 -- 6. trg_update_total_gastado_cliente
--- Actualiza el total_gastado en clientes después de cada compra confirmada.
+-- Mantiene clientes.total_gastado. Al insertar una venta el total suele ser 0
+-- (los detalles llegan después y el trigger #10 recalcula ventas.total), por
+-- eso el acumulado se ajusta también en el AFTER UPDATE de ventas, sumando solo
+-- la diferencia entre el total anterior y el nuevo (ignorando cancelados).
 -- -----------------------------------------------------------------------------
 DROP TRIGGER IF EXISTS trg_update_total_gastado_cliente//
 CREATE TRIGGER trg_update_total_gastado_cliente
@@ -198,6 +201,24 @@ BEGIN
     IF NEW.estado <> 'Cancelado' AND NEW.total > 0 THEN
         UPDATE clientes
         SET total_gastado = total_gastado + NEW.total
+        WHERE id_cliente = NEW.id_cliente;
+    END IF;
+END//
+
+DROP TRIGGER IF EXISTS trg_update_total_gastado_cliente_update//
+CREATE TRIGGER trg_update_total_gastado_cliente_update
+AFTER UPDATE ON ventas
+FOR EACH ROW
+BEGIN
+    DECLARE v_valor_anterior DECIMAL(12,2);
+    DECLARE v_valor_nuevo DECIMAL(12,2);
+
+    SET v_valor_anterior = IF(OLD.estado <> 'Cancelado', OLD.total, 0);
+    SET v_valor_nuevo    = IF(NEW.estado <> 'Cancelado', NEW.total, 0);
+
+    IF v_valor_anterior <> v_valor_nuevo THEN
+        UPDATE clientes
+        SET total_gastado = GREATEST(0, total_gastado + v_valor_nuevo - v_valor_anterior)
         WHERE id_cliente = NEW.id_cliente;
     END IF;
 END//
@@ -335,7 +356,8 @@ CREATE TRIGGER trg_send_stock_alert_on_low_stock
 AFTER UPDATE ON productos
 FOR EACH ROW
 BEGIN
-    IF NEW.stock <= NEW.umbral_minimo AND (OLD.stock > OLD.umbral_minimo OR OLD.stock <> NEW.stock) THEN
+    -- Solo alerta al CRUZAR el umbral (antes estaba por encima, ahora en o por debajo).
+    IF NEW.stock <= NEW.umbral_minimo AND OLD.stock > OLD.umbral_minimo THEN
         INSERT INTO alertas_stock (id_producto, sku, nombre_producto, stock_actual, umbral_minimo, mensaje, fecha_alerta)
         VALUES (
             NEW.id_producto,
@@ -397,14 +419,25 @@ END//
 
 -- -----------------------------------------------------------------------------
 -- 17. trg_prevent_self_referral
--- Impide que un cliente se referencie a sí mismo en el programa de referidos.
+-- Impide que un cliente se referencie a sí mismo en la tabla referidos.
 -- -----------------------------------------------------------------------------
 DROP TRIGGER IF EXISTS trg_prevent_self_referral//
 CREATE TRIGGER trg_prevent_self_referral
-BEFORE UPDATE ON clientes
+BEFORE INSERT ON referidos
 FOR EACH ROW
 BEGIN
-    IF NEW.id_referido_por IS NOT NULL AND NEW.id_referido_por = NEW.id_cliente THEN
+    IF NEW.id_cliente_referidor = NEW.id_cliente_referido THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Regla Antifraude: Un cliente no puede ser su propio referido.';
+    END IF;
+END//
+
+DROP TRIGGER IF EXISTS trg_prevent_self_referral_update//
+CREATE TRIGGER trg_prevent_self_referral_update
+BEFORE UPDATE ON referidos
+FOR EACH ROW
+BEGIN
+    IF NEW.id_cliente_referidor = NEW.id_cliente_referido THEN
         SIGNAL SQLSTATE '45000'
             SET MESSAGE_TEXT = 'Regla Antifraude: Un cliente no puede ser su propio referido.';
     END IF;
@@ -478,10 +511,25 @@ CREATE TRIGGER trg_update_producto_count_update
 AFTER UPDATE ON productos
 FOR EACH ROW
 BEGIN
-    IF OLD.id_categoria <> NEW.id_categoria THEN
+    IF NOT (OLD.id_categoria <=> NEW.id_categoria) THEN
         UPDATE categorias SET total_productos = GREATEST(0, total_productos - 1) WHERE id_categoria = OLD.id_categoria;
         UPDATE categorias SET total_productos = total_productos + 1 WHERE id_categoria = NEW.id_categoria;
     END IF;
 END//
 
 DELIMITER ;
+
+-- -----------------------------------------------------------------------------
+-- SINCRONIZACIÓN INICIAL DE CONTADORES
+-- Los datos de ejemplo de 01 se cargaron antes de existir los triggers, así que
+-- se recalculan aquí para que partan coherentes.
+-- -----------------------------------------------------------------------------
+UPDATE categorias c
+SET c.total_productos = (SELECT COUNT(*) FROM productos p WHERE p.id_categoria = c.id_categoria);
+
+UPDATE clientes cl
+SET cl.total_gastado = (
+    SELECT COALESCE(SUM(v.total), 0)
+    FROM ventas v
+    WHERE v.id_cliente = cl.id_cliente AND v.estado <> 'Cancelado'
+);
